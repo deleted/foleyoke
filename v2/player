@@ -1,0 +1,11 @@
+#!/bin/sh
+# Launch the TUI from anywhere: ./player somedirectory
+#
+# --project keeps uv pointed at this script's pyproject.toml/uv.lock without
+# changing the working directory, so relative arguments still resolve against
+# wherever the user invoked us from.
+set -e
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+exec uv run --quiet --project "$here" "$here/player.py" "$@"
