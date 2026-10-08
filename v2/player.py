@@ -76,6 +76,8 @@ PSEUDO_STYLE = "italic cyan"  # how the pseudo-directories are drawn
 ROOT_GROUP_NAME = "<root>"
 ALL_GROUP_NAME = "<all videos>"
 
+PRACTICE_TITLE = Path.home() / "foleyoke" / "practice.mp4"
+
 
 @dataclass(eq=False)
 class Group:
@@ -230,6 +232,7 @@ class PlayerApp(App):
         Binding("r", "randomize", "Random", group=CUE),
         Binding("s", "shuffle", "Shuffle"),
         Binding("space", "play", "Play", show=False),
+        Binding("p", "practice", "Practice"),
         Binding("a", "again", "Play Again"),
         Binding("slash", "filter", "Filter"),
         Binding("escape", "clear_filter", "Clear filter / dismiss", show=False),
@@ -494,6 +497,14 @@ class PlayerApp(App):
         if isinstance(self.focused, OptionList):
             self.play_cued()
 
+    def action_practice(self) -> None:
+        """play the cued video in practice mode, without advancing the cue point"""
+        group = self.cue_group()
+        if group is None:
+            return
+        video = group.cued()
+        self.play_video(video, practice=True)
+
     def action_again(self) -> None:
         """Play the last-played clip again, without advancing the cue point"""
         if self.last_played is None:
@@ -620,7 +631,7 @@ class PlayerApp(App):
 
     # ---------- playback ----------
 
-    def play_video(self, video_path: Path) -> None:
+    def play_video(self, video_path: Path, practice: bool = False) -> None:
         """Suspend the TUI, hand the terminal to mpv, then resume"""
         if shutil.which("mpv") is None:
             self.notify(
@@ -641,6 +652,7 @@ class PlayerApp(App):
                         "mpv",
                         "--fullscreen",
                         "--fs-screen=0",
+                        str(PRACTICE_TITLE) if practice else "",
                         str(video_path),
                     ]
                 )
