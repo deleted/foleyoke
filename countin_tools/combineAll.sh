@@ -50,13 +50,14 @@ function combine() {
     # this concatenates all three videos into an output file
     # with the same resolution and framerate detected from the second video
 
+    # concat's "a=0" means zero audio streams, so this produces a video-only output.
     ffmpeg -nostdin -y -i "$VIDEO1" -i "$VIDEO2" -i "$VIDEO3" \
         -filter_complex \
         "[0:v]scale=${RESOLUTION},setsar=1,fps=${FRAMERATE}[v0]; \
    [1:v]scale=${RESOLUTION},setsar=1,fps=${FRAMERATE}[v1]; \
    [2:v]scale=${RESOLUTION},setsar=1,fps=${FRAMERATE}[v2]; \
-   [v0][v1][v2]concat=n=3:v=1:a=0[outv]" \ # The "a=0" argument causes it to not drop the audio tracks
-    -map "[outv]" \
+   [v0][v1][v2]concat=n=3:v=1:a=0[outv]" \
+        -map "[outv]" \
         -c:v libx264 -preset medium -crf 23 \
         "$OUTPUT"
 
