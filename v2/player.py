@@ -77,6 +77,8 @@ ROOT_GROUP_NAME = "<root>"
 ALL_GROUP_NAME = "<all videos>"
 
 PRACTICE_TITLE = Path.home() / "foleyoke" / "practice.mp4"
+PRACTICE_BUMPS_PATH = Path.home() / "foleyoke" / "rehearsal_bumps"
+FEATURE_BUMPS_PATH = Path.home() / "foleyoke" / "feature_bumps"
 
 
 @dataclass(eq=False)
@@ -91,8 +93,10 @@ class Group:
 
     def __post_init__(self) -> None:
         # Path.relative_to() is surprisingly costly, and these never change
-        self._rel = {f: str(f.relative_to(self.path)) for f in self.files}
-        self._lower = {f: r.lower() for f, r in self._rel.items()}
+        self._rel: dict[Path, str] = {
+            f: str(f.relative_to(self.path)) for f in self.files
+        }
+        self._lower: dict[Path, str] = {f: r.lower() for f, r in self._rel.items()}
 
     def rel(self, file: Path) -> str:
         return self._rel[file]
@@ -233,6 +237,7 @@ class PlayerApp(App):
         Binding("s", "shuffle", "Shuffle"),
         Binding("space", "play", "Play", show=False),
         Binding("p", "practice", "Practice"),
+        Binding("f", "feature", "Feature"),
         Binding("a", "again", "Play Again"),
         Binding("slash", "filter", "Filter"),
         Binding("escape", "clear_filter", "Clear filter / dismiss", show=False),
@@ -241,17 +246,22 @@ class PlayerApp(App):
 
     def __init__(self, root: Path) -> None:
         super().__init__()
-        self.root = root
-        self.groups = scan_groups(root, shuffle=True)
-        self.dir_view: List[Group] = list(self.groups)  # after filtering
-        self.current: Optional[Group] = None  # highlighted directory
-        self.file_view: List[Path] = []  # current dir's files, after filtering
-        self.filter_target: Optional[str] = None  # "dirs" or "files"
-        self.needles: Dict[str, str] = {"dirs": "", "files": ""}
-        self._files_timer: Optional[Timer] = None
-        self._syncing_cue = False  # guards highlight <-> cue feedback
-        self.sub_title = str(root)
-        self.last_played: Optional[Path] = None
+        self.root: Path = root
+        self.groups: list[Group] = scan_groups(root, shuffle=True)
+        self.dir_view: list[Group] = list(self.groups)  # after filtering
+        self.current_group: Group | None = None  # highlighted directory
+        self.file_view: list[Path] = []  # current dir's files, after filtering
+        self.filter_target: str | None = None  # "dirs" or "files"
+        self.needles: dict[str, str] = {"dirs": "", "files": ""}
+        self._files_timer: Timer | None = None
+        self._syncing_cue: bool = False  # guards highlight <-> cue feedback
+        self.sub_title: str = str(root)
+        self.last_played: Path | None = None
+        self.feature_bumps: list[Path] = scan_videos(FEATURE_BUMPS_PATH)
+        self.practice_bumps: list[Path] = scan_videos(PRACTICE_BUMPS_PATH)
+        self.notify(
+            f"Loaded {len(self.feature_bumps)} feature and {len(self.practice_bumps)} practice bumps"
+        )
         # self.status = StatusBar()
         # self.status.set_left("init")
 
@@ -288,10 +298,10 @@ class PlayerApp(App):
     # ---------- list building ----------
 
     def rebuild_dirs(self) -> None:
-        keep = self.current
+        keep = self.current_group
         ol = self.dirs_list
-        ol.clear_options()
-        ol.add_options(
+        _ = ol.clear_options()
+        _ = ol.add_options(
             [
                 option(f"{g.name}  ({len(g.files)})", PSEUDO_STYLE if g.pseudo else "")
                 for g in self.dir_view
@@ -305,10 +315,10 @@ class PlayerApp(App):
             self.set_current(None)
         self.update_subtitle()
 
-    def set_current(self, group: Optional[Group]) -> None:
-        if group is self.current:
+    def set_current(self, group: Group | None) -> None:
+        if group is self.current_group:
             return
-        self.current = group
+        self.current_group = group
         self.needles["files"] = ""
         self.file_view = list(group.files) if group else []
         # Rebuilding a large file list takes long enough to be felt when keys
@@ -336,12 +346,12 @@ class PlayerApp(App):
 
     def rebuild_files(self) -> None:
         ol = self.files_list
-        group = self.current
+        group = self.current_group
         ol.border_title = group.name if group else ""
-        ol.clear_options()
+        _ = ol.clear_options()
         if group:
             cued = group.cued() if group.files else None
-            ol.add_options(
+            _ = ol.add_options(
                 [
                     option(CUE_MARKER + group.rel(f), CUE_STYLE)
                     if f == cued
@@ -357,7 +367,7 @@ class PlayerApp(App):
         The highlight *is* the cue in that pane, so every OptionList movement
         (keys, mouse, page up/down) moves the cue for free.
         """
-        group = self.current
+        group = self.current_group
         ol = self.files_list
         if not group or not group.files:
             return
@@ -374,8 +384,12 @@ class PlayerApp(App):
 
     def update_subtitle(self) -> None:
         focused = self.focused
-        if isinstance(focused, OptionList) and focused.id == "files" and self.current:
-            group = self.current
+        if (
+            isinstance(focused, OptionList)
+            and focused.id == "files"
+            and self.current_group
+        ):
+            group = self.current_group
             cue = (group.cue + 1) if group.files else 0
             shown = (
                 f" ({len(self.file_view)} shown)"
@@ -405,7 +419,7 @@ class PlayerApp(App):
 
     def cue_from_highlight(self) -> None:
         """Adopt the files-pane highlight as the cue, redrawing the marker"""
-        group = self.current
+        group = self.current_group
         idx = self.files_list.highlighted
         if not group or idx is None or idx >= len(self.file_view):
             return
@@ -434,8 +448,8 @@ class PlayerApp(App):
         if target == "dirs":
             self.dir_view = [g for g in self.groups if needle in g.name.lower()]
             self.rebuild_dirs()
-        elif self.current:
-            group = self.current
+        elif self.current_group:
+            group = self.current_group
             self.file_view = [f for f in group.files if needle in group.rel_lower(f)]
             self.cancel_files_rebuild()
             self.rebuild_files()
@@ -470,8 +484,8 @@ class PlayerApp(App):
     def action_focus_right(self) -> None:
         if (
             self.focused is not self.dirs_list
-            or not self.current
-            or not self.current.files
+            or not self.current_group
+            or not self.current_group.files
         ):
             return
         self.flush_files_rebuild()
@@ -503,7 +517,18 @@ class PlayerApp(App):
         if group is None:
             return
         video = group.cued()
-        self.play_video(video, practice=True)
+        if len(self.practice_bumps) < 1:
+            self.notify("No rehearsal bumps available")
+            return
+        preroll_clip = random.choice(self.practice_bumps)
+        self.play_video(video, preroll=preroll_clip)
+
+    def action_feature(self) -> None:
+        if isinstance(self.focused, OptionList):
+            if len(self.feature_bumps) < 1:
+                self.notify("No feature bumps available")
+            feature_title = random.choice(self.feature_bumps)
+            self.play_cued(preroll=feature_title)
 
     def action_again(self) -> None:
         """Play the last-played clip again, without advancing the cue point"""
@@ -533,7 +558,7 @@ class PlayerApp(App):
         if group is None:
             return
         group.shuffle()
-        if group is self.current:
+        if group is self.current_group:
             self.needles["files"] = ""
             self.file_view = list(group.files)
             self.cancel_files_rebuild()
@@ -568,7 +593,7 @@ class PlayerApp(App):
         highlighted row may not have settled into `current` yet.
         """
         if self.focused is self.files_list:
-            group = self.current
+            group = self.current_group
         else:
             idx = self.dirs_list.highlighted
             if idx is None or idx >= len(self.dir_view):
@@ -579,7 +604,7 @@ class PlayerApp(App):
     def move_cue(self, group: Group, cue: int) -> None:
         """Move a group's cue mark, keeping it visible if it's on screen"""
         group.cue = cue
-        if group is not self.current:
+        if group is not self.current_group:
             return
         self.cancel_files_rebuild()
         self.rebuild_files()
@@ -591,7 +616,7 @@ class PlayerApp(App):
         Usually the highlight is already on the cue and Textual has scrolled
         for us, but the cue also moves from the dirs pane, where it hasn't.
         """
-        group = self.current
+        group = self.current_group
         if not group or not group.files:
             return
         try:
@@ -613,25 +638,25 @@ class PlayerApp(App):
             immediate=True,
         )
 
-    def play_cued(self) -> None:
+    def play_cued(self, preroll: Path | None = None) -> None:
         """Play the cued video, then advance the cue to the next one"""
         group = self.cue_group()
         if group is None:
             return
         video = group.cued()
         group.advance_cue()
-        if group is self.current:
+        if group is self.current_group:
             # we're rendering right now, so drop any rebuild still queued
             self.cancel_files_rebuild()
             self.rebuild_files()
             self.scroll_to_cue()
         else:
             self.flush_files_rebuild()
-        self.play_video(video)
+        self.play_video(video, preroll=preroll)
 
     # ---------- playback ----------
 
-    def play_video(self, video_path: Path, practice: bool = False) -> None:
+    def play_video(self, video_path: Path, preroll: Optional[Path] = None) -> None:
         """Suspend the TUI, hand the terminal to mpv, then resume"""
         if shutil.which("mpv") is None:
             self.notify(
@@ -652,7 +677,7 @@ class PlayerApp(App):
                         "mpv",
                         "--fullscreen",
                         "--fs-screen=0",
-                        str(PRACTICE_TITLE) if practice else "",
+                        str(preroll) if preroll else "",
                         str(video_path),
                     ]
                 )
