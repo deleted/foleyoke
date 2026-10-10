@@ -25,13 +25,13 @@ playing anything.
   [ / ]                         -> step the cue back / forward from either pane
   r                             -> move the cue to a random video
   s                             -> shuffle the group's play order
-  (none of [ ] r s start playback - press Enter when you like the pick)
+  x                             -> skiplist / un-skiplist the selected video
+  (none of [ ] r s x start playback - press Enter when you like the pick)
   Left / h                      -> back to the directory list
   /                             -> filter the focused pane
   Esc                           -> clear filter / dismiss notifications
   q                             -> quit
 
-Requires: pip install textual
 """
 
 import os.path
@@ -46,6 +46,7 @@ from typing import Dict, List, Optional
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import CommandPalette
 from textual.containers import Horizontal
 from textual.geometry import Region
 from textual.timer import Timer
@@ -69,6 +70,11 @@ VIDEO_EXTENSIONS = {
 CUE_STYLE = "bold green"  # how the cued file is drawn
 CUE_MARKER = "▶ "  # prefix for the cued file
 CUE_PAD = "  "  # same width, keeps names aligned
+
+SKIP_STYLE = "dim"  # skiplisted files: same colour, less of it
+SKIP_CUE_STYLE = "dim green"  # ...while also cued
+SKIP_MARKER = " ✗"  # trails the name of a skiplisted file
+SKIP_MARKER_STYLE = "bold red"
 
 FILES_DEBOUNCE = 0.08  # seconds to coalesce files-pane rebuilds while navigating
 
@@ -97,6 +103,9 @@ class Group:
             f: str(f.relative_to(self.path)) for f in self.files
         }
         self._lower: dict[Path, str] = {f: r.lower() for f, r in self._rel.items()}
+        # in-memory only: skiplisted files are passed over when the cue moves
+        # on its own, but can still be cued by hand
+        self.skiplist: set[Path] = set()
 
     def rel(self, file: Path) -> str:
         return self._rel[file]
@@ -107,8 +116,37 @@ class Group:
     def cued(self) -> Path:
         return self.files[self.cue]
 
+    def skipped(self, file: Path) -> bool:
+        return file in self.skiplist
+
+    def toggle_skip(self, file: Path) -> bool:
+        """Flip a file's skiplist membership; True if it is now skiplisted"""
+        if file in self.skiplist:
+            self.skiplist.discard(file)
+            return False
+        self.skiplist.add(file)
+        return True
+
+    def next_cue(self, delta: int = 1) -> int:
+        """Step `delta` places from the cue, passing over skiplisted files
+
+        Falls back to the plain neighbour when every file is skiplisted, so
+        the cue can always move somewhere.
+        """
+        count = len(self.files)
+        if not count:
+            return 0
+        step = 1 if delta >= 0 else -1
+        plain = (self.cue + delta) % count
+        idx = plain
+        for _ in range(count):
+            if self.files[idx] not in self.skiplist:
+                return idx
+            idx = (idx + step) % count
+        return plain  # nothing playable: don't get stuck
+
     def advance_cue(self) -> None:
-        self.cue = (self.cue + 1) % len(self.files)
+        self.cue = self.next_cue(1)
 
     def cue_file(self, file: Path) -> None:
         self.cue = self.files.index(file)
@@ -180,6 +218,19 @@ def option(label: str, style: str = "") -> Option:
     return Option(Text(label, style=style))
 
 
+def file_option(label: str, cued: bool, skipped: bool) -> Option:
+    """A files-pane row: cue marker, name, and the skiplist mark"""
+    if skipped:
+        name_style = SKIP_CUE_STYLE if cued else SKIP_STYLE
+    else:
+        name_style = CUE_STYLE if cued else ""
+    text = Text(CUE_MARKER, style=CUE_STYLE) if cued else Text(CUE_PAD)
+    _ = text.append(label, style=name_style)
+    if skipped:
+        _ = text.append(SKIP_MARKER, style=SKIP_MARKER_STYLE)
+    return Option(text)
+
+
 class PlayerApp(App):
     TITLE = "Foleyoke Player"
 
@@ -235,6 +286,7 @@ class PlayerApp(App):
         Binding("right_square_bracket", "step_next(1)", "Next", group=CUE),
         Binding("r", "randomize", "Random", group=CUE),
         Binding("s", "shuffle", "Shuffle"),
+        Binding("x", "toggle_skip", "Skiplist"),
         Binding("space", "play", "Play", show=False),
         Binding("p", "practice", "Practice"),
         Binding("f", "feature", "Feature"),
@@ -353,9 +405,7 @@ class PlayerApp(App):
             cued = group.cued() if group.files else None
             _ = ol.add_options(
                 [
-                    option(CUE_MARKER + group.rel(f), CUE_STYLE)
-                    if f == cued
-                    else option(CUE_PAD + group.rel(f))
+                    file_option(group.rel(f), f == cued, group.skipped(f))
                     for f in self.file_view
                 ]
             )
@@ -396,9 +446,8 @@ class PlayerApp(App):
                 if len(self.file_view) != len(group.files)
                 else ""
             )
-            self.sub_title = (
-                f"{self.root}  |  {group.name}: cue {cue}/{len(group.files)}{shown}"
-            )
+            skipped = f", {len(group.skiplist)} skiplisted" if group.skiplist else ""
+            self.sub_title = f"{self.root}  |  {group.name}: cue {cue}/{len(group.files)}{shown}{skipped}"
         else:
             idx = self.dirs_list.highlighted
             pos = (idx + 1) if idx is not None else 0
@@ -573,7 +622,13 @@ class PlayerApp(App):
         group = self.cue_group()
         if group is None or len(group.files) < 2:
             return
-        choices = [i for i in range(len(group.files)) if i != group.cue]
+        choices = [
+            i
+            for i, f in enumerate(group.files)
+            if i != group.cue and not group.skipped(f)
+        ]
+        if not choices:  # everything else is skiplisted
+            choices = [i for i in range(len(group.files)) if i != group.cue]
         self.move_cue(group, random.choice(choices))
 
     def action_step_next(self, delta: int) -> None:
@@ -584,7 +639,28 @@ class PlayerApp(App):
         group = self.cue_group()
         if group is None:
             return
-        self.move_cue(group, (group.cue + delta) % len(group.files))
+        self.move_cue(group, group.next_cue(delta))
+
+    def action_toggle_skip(self) -> None:
+        """Skiplist (or un-skiplist) the selected video
+
+        Skiplisted files are passed over when the cue moves on its own, but
+        stay playable: cue one by hand and it plays as usual.
+        """
+        if not isinstance(self.focused, OptionList):
+            return
+        self.flush_files_rebuild()
+        group = self.cue_group()
+        if group is None:
+            return
+        file = group.cued()
+        skipped = group.toggle_skip(file)
+        if group is self.current_group:
+            self.cancel_files_rebuild()
+            self.rebuild_files()
+        self.update_subtitle()
+        verb = "Skiplisted" if skipped else "Un-skiplisted"
+        self.notify(f"{verb} {group.rel(file)}", timeout=2)
 
     def cue_group(self) -> Optional[Group]:
         """The group whose cue mark the current pane acts on
@@ -660,8 +736,7 @@ class PlayerApp(App):
         """Suspend the TUI, hand the terminal to mpv, then resume"""
         if shutil.which("mpv") is None:
             self.notify(
-                "could not play %s.\nmpv not found - is it installed and on your PATH?"
-                % os.path.basename(video_path),
+                f"could not play {os.path.basename(video_path)}.\nmpv not found - is it installed and on your PATH?",
                 severity="error",
                 timeout=4,
             )
